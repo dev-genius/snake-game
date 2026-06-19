@@ -2,333 +2,351 @@
 
 import { useEffect, useRef, useCallback, useState } from 'react'
 
-const COLS = 4
-const TILE_H = 160
-const SPEED_BASE = 3
-const GAP = 4
+const CW = 360
+const CH = 600
+const ITEM_R = 32
+const SPEED_BASE = 2.2
+const SPAWN_INTERVAL = 900 // ms
 
-type Tile = {
+const GOOD = ['🍎','🍊','🍋','🍇','🍓','🍑','🍒','🫐','🍉','❤️','🧡','💛','💚','💙','💜','🤍']
+const BAD  = ['💣','☠️','🐛']
+
+type Item = {
   id: number
-  col: number
+  x: number
   y: number
-  hit: boolean
-  missed: boolean
+  vy: number
+  emoji: string
+  bad: boolean
+  popping: boolean
+  popAlpha: number
+  popScale: number
 }
 
-let nextId = 0
+let uid = 0
 
 export default function Game() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
-  const tiles = useRef<Tile[]>([])
+  const items = useRef<Item[]>([])
   const score = useRef(0)
-  const speed = useRef(SPEED_BASE)
+  const lives = useRef(3)
+  const speed = useRef(1)
   const running = useRef(false)
   const frameRef = useRef<number | null>(null)
-  const lastTileY = useRef<number[]>([-TILE_H, -TILE_H, -TILE_H, -TILE_H])
-  const flashRef = useRef<{ col: number; alpha: number }[]>([])
-  const missFlash = useRef(0)
+  const spawnTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const screenShake = useRef(0)
+  const bgFlash = useRef<{ color: string; alpha: number } | null>(null)
 
   const [displayScore, setDisplayScore] = useState(0)
+  const [displayLives, setDisplayLives] = useState(3)
   const [best, setBest] = useState(0)
   const [phase, setPhase] = useState<'idle' | 'playing' | 'dead'>('idle')
-
-  const W = useRef(320)
-  const H = useRef(600)
-
-  const TILE_W = () => (W.current - GAP * (COLS + 1)) / COLS
-
-  const spawnTile = useCallback(() => {
-    // pick a random col that isn't the same as the last spawned
-    const lastCols = tiles.current.slice(-2).map(t => t.col)
-    const available = [0, 1, 2, 3].filter(c => !lastCols.includes(c))
-    const col = available[Math.floor(Math.random() * available.length)]
-    tiles.current.push({ id: nextId++, col, y: -TILE_H, hit: false, missed: false })
-  }, [])
 
   const draw = useCallback(() => {
     const canvas = canvasRef.current
     if (!canvas) return
     const ctx = canvas.getContext('2d')!
-    const w = W.current, h = H.current
-    const tw = TILE_W()
 
-    ctx.fillStyle = '#111'
-    ctx.fillRect(0, 0, w, h)
-
-    // Column dividers
-    for (let c = 0; c <= COLS; c++) {
-      const x = GAP + c * (tw + GAP)
-      ctx.fillStyle = '#1a1a1a'
-      ctx.fillRect(x - GAP / 2, 0, GAP, h)
+    ctx.save()
+    if (screenShake.current > 0) {
+      const s = screenShake.current * 3
+      ctx.translate((Math.random() - 0.5) * s, (Math.random() - 0.5) * s)
+      screenShake.current -= 1
     }
 
-    // Hit zone bar at bottom
-    ctx.fillStyle = '#1e1e2e'
-    ctx.fillRect(0, h - TILE_H - GAP, w, TILE_H + GAP)
-    ctx.fillStyle = '#2a2a4a'
-    ctx.fillRect(0, h - TILE_H - GAP, w, 2)
+    // Background gradient
+    const bg = ctx.createLinearGradient(0, 0, 0, CH)
+    bg.addColorStop(0, '#0f0c29')
+    bg.addColorStop(1, '#302b63')
+    ctx.fillStyle = bg
+    ctx.fillRect(0, 0, CW, CH)
 
-    // Miss flash
-    if (missFlash.current > 0) {
-      ctx.fillStyle = `rgba(255,50,50,${missFlash.current / 20 * 0.3})`
-      ctx.fillRect(0, 0, w, h)
-      missFlash.current--
+    // Flash effect
+    if (bgFlash.current && bgFlash.current.alpha > 0) {
+      ctx.fillStyle = bgFlash.current.color.replace('1)', `${bgFlash.current.alpha})`)
+      ctx.fillRect(0, 0, CW, CH)
+      bgFlash.current.alpha -= 0.06
     }
 
-    // Flash effects
-    flashRef.current = flashRef.current.filter(f => f.alpha > 0)
-    for (const f of flashRef.current) {
-      const x = GAP + f.col * (tw + GAP)
-      const grad = ctx.createLinearGradient(x, h - TILE_H, x, h)
-      grad.addColorStop(0, `rgba(100,200,255,0)`)
-      grad.addColorStop(1, `rgba(100,200,255,${f.alpha})`)
-      ctx.fillStyle = grad
-      ctx.fillRect(x, h - TILE_H, tw, TILE_H)
-      f.alpha -= 0.06
-    }
+    // Ground line
+    ctx.strokeStyle = 'rgba(255,255,255,0.15)'
+    ctx.lineWidth = 2
+    ctx.setLineDash([8, 6])
+    ctx.beginPath()
+    ctx.moveTo(0, CH - 20)
+    ctx.lineTo(CW, CH - 20)
+    ctx.stroke()
+    ctx.setLineDash([])
 
-    // Tiles
-    for (const tile of tiles.current) {
-      const x = GAP + tile.col * (tw + GAP)
-      const y = tile.y
+    // Items
+    for (const item of items.current) {
+      ctx.save()
+      const cx = item.x
+      const cy = item.y
 
-      if (tile.hit) {
-        // Hit animation - bright flash
-        ctx.fillStyle = '#64c8ff'
-        ctx.beginPath()
-        ;(ctx as CanvasRenderingContext2D & { roundRect: Function }).roundRect(x, y, tw, TILE_H - GAP, 10)
-        ctx.fill()
-      } else if (tile.missed) {
-        ctx.fillStyle = '#ff3232'
-        ctx.beginPath()
-        ;(ctx as CanvasRenderingContext2D & { roundRect: Function }).roundRect(x, y, tw, TILE_H - GAP, 10)
-        ctx.fill()
+      if (item.popping) {
+        // Pop animation
+        ctx.globalAlpha = item.popAlpha
+        ctx.font = `${ITEM_R * 2 * item.popScale}px serif`
+        ctx.textAlign = 'center'
+        ctx.textBaseline = 'middle'
+        ctx.fillText(item.emoji, cx, cy)
+        item.popAlpha -= 0.05
+        item.popScale += 0.08
       } else {
-        // Normal tile
-        const isInZone = y + TILE_H > h - TILE_H - GAP && y < h
-        ctx.fillStyle = isInZone ? '#1a1a1a' : '#0d0d0d'
-        ctx.beginPath()
-        ;(ctx as CanvasRenderingContext2D & { roundRect: Function }).roundRect(x, y, tw, TILE_H - GAP, 10)
-        ctx.fill()
+        // Shadow
+        ctx.globalAlpha = 0.25
+        ctx.filter = 'blur(6px)'
+        ctx.font = `${ITEM_R * 2}px serif`
+        ctx.textAlign = 'center'
+        ctx.textBaseline = 'middle'
+        ctx.fillText(item.emoji, cx + 4, cy + 6)
+        ctx.filter = 'none'
+        ctx.globalAlpha = 1
 
-        // Glow for tiles in hit zone
-        if (isInZone) {
-          ctx.strokeStyle = 'rgba(100,200,255,0.15)'
-          ctx.lineWidth = 1
-          ctx.stroke()
+        // Slight bobbing scale
+        const wobble = 1 + Math.sin(Date.now() / 200 + item.id) * 0.04
+        ctx.font = `${ITEM_R * 2 * wobble}px serif`
+        ctx.textAlign = 'center'
+        ctx.textBaseline = 'middle'
+        ctx.fillText(item.emoji, cx, cy)
+
+        // Danger glow for bad items
+        if (item.bad) {
+          ctx.globalAlpha = 0.3 + Math.sin(Date.now() / 150) * 0.2
+          ctx.fillStyle = 'rgba(255,50,50,0.4)'
+          ctx.beginPath()
+          ctx.arc(cx, cy, ITEM_R + 8, 0, Math.PI * 2)
+          ctx.fill()
+          ctx.globalAlpha = 1
         }
       }
+      ctx.restore()
     }
 
-    // Score
-    ctx.fillStyle = 'rgba(255,255,255,0.9)'
-    ctx.font = `bold ${w * 0.12}px system-ui`
-    ctx.textAlign = 'center'
-    ctx.fillText(String(score.current), w / 2, 70)
+    ctx.restore()
+  }, [])
 
-    // Hint arrows in hit zone columns (when idle)
+  const spawnItem = useCallback(() => {
     if (!running.current) return
+    const bad = Math.random() < 0.18
+    const list = bad ? BAD : GOOD
+    const emoji = list[Math.floor(Math.random() * list.length)]
+    const margin = ITEM_R + 10
+    const x = margin + Math.random() * (CW - margin * 2)
+    items.current.push({
+      id: uid++,
+      x,
+      y: -ITEM_R,
+      vy: SPEED_BASE * speed.current,
+      emoji,
+      bad,
+      popping: false,
+      popAlpha: 1,
+      popScale: 1,
+    })
 
+    const interval = Math.max(350, SPAWN_INTERVAL - score.current * 8)
+    spawnTimer.current = setTimeout(spawnItem, interval)
   }, [])
 
   const gameLoop = useCallback(() => {
     if (!running.current) return
-    const h = H.current
-    const tw = TILE_W()
 
-    // Move tiles
-    for (const tile of tiles.current) {
-      if (!tile.hit) tile.y += speed.current
+    for (const item of items.current) {
+      if (!item.popping) item.y += item.vy * speed.current
     }
 
-    // Spawn new tiles
-    const lowestTile = tiles.current
-      .filter(t => !t.hit && !t.missed)
-      .reduce((min, t) => Math.min(min, t.y), Infinity)
-
-    if (lowestTile > TILE_H * 0.8 || tiles.current.filter(t => !t.hit && !t.missed).length === 0) {
-      spawnTile()
-    }
-
-    // Check missed tiles (passed the hit zone without being hit)
-    for (const tile of tiles.current) {
-      if (!tile.hit && !tile.missed && tile.y > h) {
-        tile.missed = true
-        running.current = false
-        missFlash.current = 20
-        draw()
-        setTimeout(() => setPhase('dead'), 400)
-        if (frameRef.current) cancelAnimationFrame(frameRef.current)
-        return
+    // Check missed / ground hit
+    for (const item of items.current) {
+      if (!item.popping && item.y > CH - 20 + ITEM_R) {
+        if (!item.bad) {
+          // Missed good item → lose life
+          item.popping = true
+          lives.current = Math.max(0, lives.current - 1)
+          setDisplayLives(lives.current)
+          screenShake.current = 6
+          bgFlash.current = { color: 'rgba(255,0,0,1)', alpha: 0.3 }
+          if (lives.current <= 0) {
+            running.current = false
+            if (spawnTimer.current) clearTimeout(spawnTimer.current)
+            draw()
+            setTimeout(() => setPhase('dead'), 600)
+            if (frameRef.current) cancelAnimationFrame(frameRef.current)
+            return
+          }
+        } else {
+          item.popping = true
+        }
       }
     }
 
-    // Remove old tiles
-    tiles.current = tiles.current.filter(t => t.y < h + TILE_H * 2)
+    // Remove finished pops and off-screen
+    items.current = items.current.filter(i =>
+      !(i.popping && i.popAlpha <= 0) && i.y < CH + 100
+    )
 
     draw()
     frameRef.current = requestAnimationFrame(gameLoop)
-  }, [draw, spawnTile])
+  }, [draw])
 
   const startGame = useCallback(() => {
-    tiles.current = []
+    items.current = []
     score.current = 0
-    speed.current = SPEED_BASE
-    missFlash.current = 0
-    flashRef.current = []
+    lives.current = 3
+    speed.current = 1
+    screenShake.current = 0
+    bgFlash.current = null
+    uid = 0
     setDisplayScore(0)
+    setDisplayLives(3)
     setPhase('playing')
     running.current = true
-    spawnTile()
+    if (spawnTimer.current) clearTimeout(spawnTimer.current)
+    spawnTimer.current = setTimeout(spawnItem, 300)
     if (frameRef.current) cancelAnimationFrame(frameRef.current)
     frameRef.current = requestAnimationFrame(gameLoop)
-  }, [gameLoop, spawnTile])
+  }, [gameLoop, spawnItem])
 
-  const handleTap = useCallback((clientX: number, clientY: number) => {
+  const tap = useCallback((clientX: number, clientY: number) => {
     if (!running.current) return
     const canvas = canvasRef.current
     if (!canvas) return
-
     const rect = canvas.getBoundingClientRect()
-    const scaleX = W.current / rect.width
-    const scaleY = H.current / rect.height
-    const x = (clientX - rect.left) * scaleX
-    const y = (clientY - rect.top) * scaleY
-    const h = H.current
-    const tw = TILE_W()
+    const scaleX = CW / rect.width
+    const scaleY = CH / rect.height
+    const tx = (clientX - rect.left) * scaleX
+    const ty = (clientY - rect.top) * scaleY
 
-    const col = Math.floor(x / (tw + GAP))
-    if (col < 0 || col >= COLS) return
+    // Find closest tappable item
+    let hit: Item | null = null
+    let minDist = ITEM_R * 2.2
+    for (const item of items.current) {
+      if (item.popping) continue
+      const d = Math.hypot(item.x - tx, item.y - ty)
+      if (d < minDist) { minDist = d; hit = item }
+    }
 
-    // Find the lowest unhit tile in this col within hit zone or above bottom
-    const inZone = tiles.current
-      .filter(t => t.col === col && !t.hit && !t.missed && t.y + TILE_H > h - TILE_H - 20 && t.y < h + 10)
-      .sort((a, b) => b.y - a.y)
-
-    if (inZone.length > 0) {
-      const tile = inZone[0]
-      tile.hit = true
-      score.current++
-      speed.current = SPEED_BASE + Math.floor(score.current / 10) * 0.8
-      setDisplayScore(score.current)
-      setBest(b => {
-        const nb = Math.max(b, score.current)
-        localStorage.setItem('piano-best', String(nb))
-        return nb
-      })
-      flashRef.current.push({ col, alpha: 0.5 })
-
-      // Remove hit tile after short delay visually
-      setTimeout(() => {
-        tiles.current = tiles.current.filter(t => t.id !== tile.id)
-      }, 100)
+    if (hit) {
+      hit.popping = true
+      if (hit.bad) {
+        // Hit bomb → lose life
+        lives.current = Math.max(0, lives.current - 1)
+        setDisplayLives(lives.current)
+        screenShake.current = 8
+        bgFlash.current = { color: 'rgba(255,50,0,1)', alpha: 0.45 }
+        if (lives.current <= 0) {
+          running.current = false
+          if (spawnTimer.current) clearTimeout(spawnTimer.current)
+          setTimeout(() => setPhase('dead'), 600)
+          if (frameRef.current) cancelAnimationFrame(frameRef.current)
+        }
+      } else {
+        // Caught good item
+        score.current++
+        speed.current = 1 + Math.floor(score.current / 10) * 0.25
+        setDisplayScore(score.current)
+        setBest(b => {
+          const nb = Math.max(b, score.current)
+          localStorage.setItem('catch-best', String(nb))
+          return nb
+        })
+        bgFlash.current = { color: 'rgba(255,255,255,1)', alpha: 0.08 }
+      }
     }
   }, [])
 
-  // Resize canvas to fit screen
   useEffect(() => {
-    const resize = () => {
-      const maxW = Math.min(window.innerWidth, 400)
-      const maxH = Math.min(window.innerHeight - 160, 640)
-      W.current = maxW
-      H.current = maxH
-      const canvas = canvasRef.current
-      if (canvas) {
-        canvas.width = maxW
-        canvas.height = maxH
-      }
-      draw()
-    }
-    resize()
-    window.addEventListener('resize', resize)
-    return () => window.removeEventListener('resize', resize)
-  }, [draw])
-
-  useEffect(() => {
-    setBest(parseInt(localStorage.getItem('piano-best') || '0'))
+    setBest(parseInt(localStorage.getItem('catch-best') || '0'))
     draw()
   }, [draw])
 
-  useEffect(() => {
-    return () => { if (frameRef.current) cancelAnimationFrame(frameRef.current) }
+  useEffect(() => () => {
+    if (frameRef.current) cancelAnimationFrame(frameRef.current)
+    if (spawnTimer.current) clearTimeout(spawnTimer.current)
   }, [])
+
+  const heartDisplay = (n: number) =>
+    Array.from({ length: 3 }, (_, i) => (
+      <span key={i} style={{ fontSize: '1.4rem', opacity: i < n ? 1 : 0.15 }}>❤️</span>
+    ))
 
   return (
     <div style={{
       minHeight: '100dvh',
-      background: '#0a0a0a',
+      background: '#0a0814',
       display: 'flex',
       flexDirection: 'column',
       alignItems: 'center',
       justifyContent: 'center',
-      gap: 12,
+      gap: 14,
       fontFamily: 'system-ui, sans-serif',
       userSelect: 'none',
+      WebkitUserSelect: 'none',
     }}>
       {/* Header */}
-      <div style={{ display: 'flex', gap: 16, alignItems: 'center' }}>
+      <div style={{ display: 'flex', gap: 20, alignItems: 'center', width: CW, maxWidth: '95vw', justifyContent: 'space-between' }}>
         <div style={{ textAlign: 'center' }}>
-          <div style={{ fontSize: '0.65rem', color: '#555', letterSpacing: 2, textTransform: 'uppercase' }}>최고</div>
-          <div style={{ fontSize: '1.4rem', fontWeight: 800, color: '#eee' }}>{best}</div>
+          <div style={{ fontSize: '0.6rem', color: '#555', letterSpacing: 2, textTransform: 'uppercase' }}>최고</div>
+          <div style={{ fontSize: '1.3rem', fontWeight: 900, color: '#eee' }}>{best}</div>
         </div>
-        <h1 style={{
-          fontSize: '1.6rem', fontWeight: 900, letterSpacing: -1,
-          background: 'linear-gradient(135deg, #fff, #888)',
-          WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent',
-        }}>피아노 타일</h1>
+        <div style={{ display: 'flex', gap: 4 }}>{heartDisplay(displayLives)}</div>
         <div style={{ textAlign: 'center' }}>
-          <div style={{ fontSize: '0.65rem', color: '#555', letterSpacing: 2, textTransform: 'uppercase' }}>레벨</div>
-          <div style={{ fontSize: '1.4rem', fontWeight: 800, color: '#eee' }}>
-            {Math.floor(displayScore / 10) + 1}
-          </div>
+          <div style={{ fontSize: '0.6rem', color: '#555', letterSpacing: 2, textTransform: 'uppercase' }}>점수</div>
+          <div style={{ fontSize: '1.3rem', fontWeight: 900, color: '#eee' }}>{displayScore}</div>
         </div>
       </div>
 
       {/* Canvas */}
-      <div style={{ position: 'relative' }}>
+      <div style={{ position: 'relative', lineHeight: 0 }}>
         <canvas
           ref={canvasRef}
-          style={{ display: 'block', borderRadius: 16, touchAction: 'none' }}
+          width={CW}
+          height={CH}
+          style={{ display: 'block', borderRadius: 20, touchAction: 'none', maxWidth: '95vw' }}
           onPointerDown={e => {
             e.preventDefault()
             if (phase === 'idle' || phase === 'dead') { startGame(); return }
-            handleTap(e.clientX, e.clientY)
+            tap(e.clientX, e.clientY)
           }}
         />
 
-        {/* Overlay */}
         {(phase === 'idle' || phase === 'dead') && (
           <div style={{
-            position: 'absolute', inset: 0, borderRadius: 16,
-            background: 'rgba(0,0,0,0.82)',
+            position: 'absolute', inset: 0, borderRadius: 20,
+            background: 'rgba(5,3,20,0.88)',
             display: 'flex', flexDirection: 'column',
             alignItems: 'center', justifyContent: 'center', gap: 16,
-            backdropFilter: 'blur(6px)',
+            backdropFilter: 'blur(10px)',
           }}>
             {phase === 'dead' ? (
               <>
-                <div style={{ fontSize: '2rem', fontWeight: 900, color: '#ff4444' }}>실패!</div>
-                <div style={{ fontSize: '3rem', fontWeight: 900, color: '#fff' }}>{displayScore}</div>
+                <div style={{ fontSize: '3rem' }}>😵</div>
+                <div style={{ fontSize: '2rem', fontWeight: 900, color: '#ff4444' }}>게임 오버</div>
+                <div style={{ fontSize: '3.5rem', fontWeight: 900, color: '#fff', lineHeight: 1 }}>{displayScore}</div>
                 <div style={{ color: '#555', fontSize: '0.85rem' }}>최고기록 {best}</div>
               </>
             ) : (
               <>
-                <div style={{ fontSize: '2.5rem' }}>🎹</div>
-                <div style={{ fontSize: '1.4rem', fontWeight: 900, color: '#fff' }}>피아노 타일</div>
-                <div style={{ color: '#555', fontSize: '0.85rem', textAlign: 'center', lineHeight: 1.6 }}>
-                  검은 타일을 탭하세요<br/>놓치면 게임 오버!
+                <div style={{ fontSize: '2.5rem' }}>🍎❤️🍊</div>
+                <div style={{ fontSize: '1.5rem', fontWeight: 900, color: '#fff' }}>캐치!</div>
+                <div style={{ color: '#666', fontSize: '0.85rem', textAlign: 'center', lineHeight: 1.9 }}>
+                  떨어지는 걸 탭해서 잡으세요<br/>
+                  <span style={{ color: '#ff6b6b' }}>💣 폭탄</span>은 피하세요!<br/>
+                  놓치면 ❤️ 하나 잃어요
                 </div>
               </>
             )}
             <button
               onPointerDown={e => { e.stopPropagation(); startGame() }}
               style={{
-                background: '#fff', color: '#000',
-                border: 'none', borderRadius: 50,
-                padding: '14px 40px', fontSize: '1rem', fontWeight: 800,
-                cursor: 'pointer', marginTop: 8,
+                background: 'linear-gradient(135deg,#a855f7,#ec4899)',
+                color: '#fff', border: 'none', borderRadius: 50,
+                padding: '14px 44px', fontSize: '1.05rem', fontWeight: 800,
+                cursor: 'pointer', marginTop: 6,
+                boxShadow: '0 4px 20px rgba(168,85,247,0.4)',
               }}>
-              {phase === 'dead' ? '다시 시작' : '시작'}
+              {phase === 'dead' ? '다시 시작' : '시작하기'}
             </button>
           </div>
         )}
