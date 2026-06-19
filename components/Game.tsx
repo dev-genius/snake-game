@@ -2,366 +2,336 @@
 
 import { useEffect, useRef, useCallback, useState } from 'react'
 
-const COLS = 20
-const ROWS = 20
-const CELL = 24
-const W = COLS * CELL
-const H = ROWS * CELL
+const COLS = 4
+const TILE_H = 160
+const SPEED_BASE = 3
+const GAP = 4
 
-type Dir = 'U' | 'D' | 'L' | 'R'
-type Pt = { x: number; y: number }
-
-function rand(max: number) {
-  return Math.floor(Math.random() * max)
+type Tile = {
+  id: number
+  col: number
+  y: number
+  hit: boolean
+  missed: boolean
 }
 
-function newFood(snake: Pt[]): Pt {
-  let f: Pt
-  do {
-    f = { x: rand(COLS), y: rand(ROWS) }
-  } while (snake.some(s => s.x === f.x && s.y === f.y))
-  return f
-}
-
-const COLORS = {
-  bg: '#0d0d1a',
-  grid: '#131325',
-  food: '#ff4757',
-  foodGlow: '#ff6b81',
-  head: '#2ed573',
-  body: '#1abc9c',
-  tail: '#0e8c6a',
-  text: '#eaeaea',
-  accent: '#e94560',
-}
-
-const SPEED_LEVELS = [200, 160, 130, 105, 85, 68, 55, 44, 36, 28]
+let nextId = 0
 
 export default function Game() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
-  const snake = useRef<Pt[]>([{ x: 10, y: 10 }])
-  const dir = useRef<Dir>('R')
-  const nextDir = useRef<Dir>('R')
-  const food = useRef<Pt>(newFood(snake.current))
+  const tiles = useRef<Tile[]>([])
   const score = useRef(0)
+  const speed = useRef(SPEED_BASE)
   const running = useRef(false)
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const frameRef = useRef<number | null>(null)
-  const particles = useRef<{ x: number; y: number; vx: number; vy: number; life: number; color: string }[]>([])
+  const lastTileY = useRef<number[]>([-TILE_H, -TILE_H, -TILE_H, -TILE_H])
+  const flashRef = useRef<{ col: number; alpha: number }[]>([])
+  const missFlash = useRef(0)
 
   const [displayScore, setDisplayScore] = useState(0)
   const [best, setBest] = useState(0)
   const [phase, setPhase] = useState<'idle' | 'playing' | 'dead'>('idle')
-  const [level, setLevel] = useState(1)
+
+  const W = useRef(320)
+  const H = useRef(600)
+
+  const TILE_W = () => (W.current - GAP * (COLS + 1)) / COLS
+
+  const spawnTile = useCallback(() => {
+    // pick a random col that isn't the same as the last spawned
+    const lastCols = tiles.current.slice(-2).map(t => t.col)
+    const available = [0, 1, 2, 3].filter(c => !lastCols.includes(c))
+    const col = available[Math.floor(Math.random() * available.length)]
+    tiles.current.push({ id: nextId++, col, y: -TILE_H, hit: false, missed: false })
+  }, [])
 
   const draw = useCallback(() => {
     const canvas = canvasRef.current
     if (!canvas) return
     const ctx = canvas.getContext('2d')!
+    const w = W.current, h = H.current
+    const tw = TILE_W()
 
-    // Background
-    ctx.fillStyle = COLORS.bg
-    ctx.fillRect(0, 0, W, H)
+    ctx.fillStyle = '#111'
+    ctx.fillRect(0, 0, w, h)
 
-    // Grid
-    ctx.strokeStyle = COLORS.grid
-    ctx.lineWidth = 0.5
-    for (let x = 0; x <= COLS; x++) {
-      ctx.beginPath(); ctx.moveTo(x * CELL, 0); ctx.lineTo(x * CELL, H); ctx.stroke()
-    }
-    for (let y = 0; y <= ROWS; y++) {
-      ctx.beginPath(); ctx.moveTo(0, y * CELL); ctx.lineTo(W, y * CELL); ctx.stroke()
+    // Column dividers
+    for (let c = 0; c <= COLS; c++) {
+      const x = GAP + c * (tw + GAP)
+      ctx.fillStyle = '#1a1a1a'
+      ctx.fillRect(x - GAP / 2, 0, GAP, h)
     }
 
-    // Particles
-    particles.current = particles.current.filter(p => p.life > 0)
-    for (const p of particles.current) {
-      ctx.globalAlpha = p.life / 30
-      ctx.fillStyle = p.color
-      ctx.beginPath()
-      ctx.arc(p.x, p.y, 3, 0, Math.PI * 2)
-      ctx.fill()
-      p.x += p.vx; p.y += p.vy; p.life--
+    // Hit zone bar at bottom
+    ctx.fillStyle = '#1e1e2e'
+    ctx.fillRect(0, h - TILE_H - GAP, w, TILE_H + GAP)
+    ctx.fillStyle = '#2a2a4a'
+    ctx.fillRect(0, h - TILE_H - GAP, w, 2)
+
+    // Miss flash
+    if (missFlash.current > 0) {
+      ctx.fillStyle = `rgba(255,50,50,${missFlash.current / 20 * 0.3})`
+      ctx.fillRect(0, 0, w, h)
+      missFlash.current--
     }
-    ctx.globalAlpha = 1
 
-    // Food glow
-    const f = food.current
-    const grd = ctx.createRadialGradient(
-      f.x * CELL + CELL / 2, f.y * CELL + CELL / 2, 2,
-      f.x * CELL + CELL / 2, f.y * CELL + CELL / 2, CELL,
-    )
-    grd.addColorStop(0, 'rgba(255,71,87,0.4)')
-    grd.addColorStop(1, 'rgba(255,71,87,0)')
-    ctx.fillStyle = grd
-    ctx.fillRect(f.x * CELL - CELL / 2, f.y * CELL - CELL / 2, CELL * 2, CELL * 2)
+    // Flash effects
+    flashRef.current = flashRef.current.filter(f => f.alpha > 0)
+    for (const f of flashRef.current) {
+      const x = GAP + f.col * (tw + GAP)
+      const grad = ctx.createLinearGradient(x, h - TILE_H, x, h)
+      grad.addColorStop(0, `rgba(100,200,255,0)`)
+      grad.addColorStop(1, `rgba(100,200,255,${f.alpha})`)
+      ctx.fillStyle = grad
+      ctx.fillRect(x, h - TILE_H, tw, TILE_H)
+      f.alpha -= 0.06
+    }
 
-    // Food
-    ctx.fillStyle = COLORS.food
-    ctx.beginPath()
-    const fx = f.x * CELL + CELL / 2
-    const fy = f.y * CELL + CELL / 2
-    ctx.arc(fx, fy, CELL / 2 - 3, 0, Math.PI * 2)
-    ctx.fill()
+    // Tiles
+    for (const tile of tiles.current) {
+      const x = GAP + tile.col * (tw + GAP)
+      const y = tile.y
 
-    // Snake
-    const s = snake.current
-    for (let i = s.length - 1; i >= 0; i--) {
-      const t = i / s.length
-      if (i === 0) {
-        ctx.fillStyle = COLORS.head
+      if (tile.hit) {
+        // Hit animation - bright flash
+        ctx.fillStyle = '#64c8ff'
+        ctx.beginPath()
+        ;(ctx as CanvasRenderingContext2D & { roundRect: Function }).roundRect(x, y, tw, TILE_H - GAP, 10)
+        ctx.fill()
+      } else if (tile.missed) {
+        ctx.fillStyle = '#ff3232'
+        ctx.beginPath()
+        ;(ctx as CanvasRenderingContext2D & { roundRect: Function }).roundRect(x, y, tw, TILE_H - GAP, 10)
+        ctx.fill()
       } else {
-        const r = Math.round(30 + t * 14)
-        const g = Math.round(188 - t * 60)
-        const b = Math.round(156 - t * 60)
-        ctx.fillStyle = `rgb(${r},${g},${b})`
-      }
-      const pad = i === 0 ? 2 : 3
-      const radius = i === 0 ? 6 : 4
-      const sx = s[i].x * CELL + pad
-      const sy = s[i].y * CELL + pad
-      const sw = CELL - pad * 2
-      const sh = CELL - pad * 2
-      ctx.beginPath()
-      ctx.roundRect(sx, sy, sw, sh, radius)
-      ctx.fill()
+        // Normal tile
+        const isInZone = y + TILE_H > h - TILE_H - GAP && y < h
+        ctx.fillStyle = isInZone ? '#1a1a1a' : '#0d0d0d'
+        ctx.beginPath()
+        ;(ctx as CanvasRenderingContext2D & { roundRect: Function }).roundRect(x, y, tw, TILE_H - GAP, 10)
+        ctx.fill()
 
-      // Eyes on head
-      if (i === 0) {
-        ctx.fillStyle = '#0d0d1a'
-        const d = dir.current
-        const ex1 = sx + (d === 'R' ? sw - 5 : d === 'L' ? 3 : 5)
-        const ey1 = sy + (d === 'D' ? sh - 5 : d === 'U' ? 3 : 5)
-        const ex2 = sx + (d === 'R' ? sw - 5 : d === 'L' ? 3 : sw - 5)
-        const ey2 = sy + (d === 'D' ? sh - 5 : d === 'U' ? 3 : sh - 5)
-        ctx.beginPath(); ctx.arc(ex1, ey1, 2.5, 0, Math.PI * 2); ctx.fill()
-        ctx.beginPath(); ctx.arc(ex2, ey2, 2.5, 0, Math.PI * 2); ctx.fill()
+        // Glow for tiles in hit zone
+        if (isInZone) {
+          ctx.strokeStyle = 'rgba(100,200,255,0.15)'
+          ctx.lineWidth = 1
+          ctx.stroke()
+        }
       }
     }
-  }, [])
 
-  const spawnParticles = useCallback((x: number, y: number) => {
-    for (let i = 0; i < 16; i++) {
-      const angle = (i / 16) * Math.PI * 2
-      const speed = 1.5 + Math.random() * 3
-      particles.current.push({
-        x: x * CELL + CELL / 2,
-        y: y * CELL + CELL / 2,
-        vx: Math.cos(angle) * speed,
-        vy: Math.sin(angle) * speed,
-        life: 20 + Math.floor(Math.random() * 15),
-        color: ['#ff4757', '#ffa502', '#eccc68', '#ff6b81'][Math.floor(Math.random() * 4)],
-      })
-    }
-  }, [])
+    // Score
+    ctx.fillStyle = 'rgba(255,255,255,0.9)'
+    ctx.font = `bold ${w * 0.12}px system-ui`
+    ctx.textAlign = 'center'
+    ctx.fillText(String(score.current), w / 2, 70)
 
-  const tick = useCallback(() => {
+    // Hint arrows in hit zone columns (when idle)
     if (!running.current) return
 
-    dir.current = nextDir.current
-    const head = snake.current[0]
-    let nx = head.x, ny = head.y
-    if (dir.current === 'R') nx++
-    else if (dir.current === 'L') nx--
-    else if (dir.current === 'U') ny--
-    else ny++
+  }, [])
 
-    // Wall collision
-    if (nx < 0 || nx >= COLS || ny < 0 || ny >= ROWS) {
-      running.current = false
-      setPhase('dead')
-      return
+  const gameLoop = useCallback(() => {
+    if (!running.current) return
+    const h = H.current
+    const tw = TILE_W()
+
+    // Move tiles
+    for (const tile of tiles.current) {
+      if (!tile.hit) tile.y += speed.current
     }
 
-    // Self collision
-    if (snake.current.some(s => s.x === nx && s.y === ny)) {
-      running.current = false
-      setPhase('dead')
-      return
+    // Spawn new tiles
+    const lowestTile = tiles.current
+      .filter(t => !t.hit && !t.missed)
+      .reduce((min, t) => Math.min(min, t.y), Infinity)
+
+    if (lowestTile > TILE_H * 0.8 || tiles.current.filter(t => !t.hit && !t.missed).length === 0) {
+      spawnTile()
     }
 
-    const ate = food.current.x === nx && food.current.y === ny
-    const newSnake = [{ x: nx, y: ny }, ...snake.current]
-    if (!ate) newSnake.pop()
+    // Check missed tiles (passed the hit zone without being hit)
+    for (const tile of tiles.current) {
+      if (!tile.hit && !tile.missed && tile.y > h) {
+        tile.missed = true
+        running.current = false
+        missFlash.current = 20
+        draw()
+        setTimeout(() => setPhase('dead'), 400)
+        if (frameRef.current) cancelAnimationFrame(frameRef.current)
+        return
+      }
+    }
 
-    snake.current = newSnake
+    // Remove old tiles
+    tiles.current = tiles.current.filter(t => t.y < h + TILE_H * 2)
 
-    if (ate) {
-      spawnParticles(nx, ny)
+    draw()
+    frameRef.current = requestAnimationFrame(gameLoop)
+  }, [draw, spawnTile])
+
+  const startGame = useCallback(() => {
+    tiles.current = []
+    score.current = 0
+    speed.current = SPEED_BASE
+    missFlash.current = 0
+    flashRef.current = []
+    setDisplayScore(0)
+    setPhase('playing')
+    running.current = true
+    spawnTile()
+    if (frameRef.current) cancelAnimationFrame(frameRef.current)
+    frameRef.current = requestAnimationFrame(gameLoop)
+  }, [gameLoop, spawnTile])
+
+  const handleTap = useCallback((clientX: number, clientY: number) => {
+    if (!running.current) return
+    const canvas = canvasRef.current
+    if (!canvas) return
+
+    const rect = canvas.getBoundingClientRect()
+    const scaleX = W.current / rect.width
+    const scaleY = H.current / rect.height
+    const x = (clientX - rect.left) * scaleX
+    const y = (clientY - rect.top) * scaleY
+    const h = H.current
+    const tw = TILE_W()
+
+    const col = Math.floor(x / (tw + GAP))
+    if (col < 0 || col >= COLS) return
+
+    // Find the lowest unhit tile in this col within hit zone or above bottom
+    const inZone = tiles.current
+      .filter(t => t.col === col && !t.hit && !t.missed && t.y + TILE_H > h - TILE_H - 20 && t.y < h + 10)
+      .sort((a, b) => b.y - a.y)
+
+    if (inZone.length > 0) {
+      const tile = inZone[0]
+      tile.hit = true
       score.current++
+      speed.current = SPEED_BASE + Math.floor(score.current / 10) * 0.8
       setDisplayScore(score.current)
       setBest(b => {
         const nb = Math.max(b, score.current)
-        localStorage.setItem('snake-best', String(nb))
+        localStorage.setItem('piano-best', String(nb))
         return nb
       })
-      food.current = newFood(newSnake)
-      const lv = Math.min(10, 1 + Math.floor(score.current / 5))
-      setLevel(lv)
+      flashRef.current.push({ col, alpha: 0.5 })
+
+      // Remove hit tile after short delay visually
+      setTimeout(() => {
+        tiles.current = tiles.current.filter(t => t.id !== tile.id)
+      }, 100)
     }
+  }, [])
 
-    draw()
-
-    if (running.current) {
-      const lv = Math.min(10, 1 + Math.floor(score.current / 5))
-      timerRef.current = setTimeout(tick, SPEED_LEVELS[lv - 1])
-    }
-  }, [draw, spawnParticles])
-
-  const startGame = useCallback(() => {
-    snake.current = [{ x: 10, y: 10 }]
-    dir.current = 'R'
-    nextDir.current = 'R'
-    food.current = newFood(snake.current)
-    score.current = 0
-    particles.current = []
-    setDisplayScore(0)
-    setLevel(1)
-    setPhase('playing')
-    running.current = true
-    if (timerRef.current) clearTimeout(timerRef.current)
-    timerRef.current = setTimeout(tick, SPEED_LEVELS[0])
-    draw()
-  }, [tick, draw])
-
-  // Animation loop for particles
+  // Resize canvas to fit screen
   useEffect(() => {
-    let id: number
-    const loop = () => {
-      if (particles.current.length > 0) draw()
-      id = requestAnimationFrame(loop)
+    const resize = () => {
+      const maxW = Math.min(window.innerWidth, 400)
+      const maxH = Math.min(window.innerHeight - 160, 640)
+      W.current = maxW
+      H.current = maxH
+      const canvas = canvasRef.current
+      if (canvas) {
+        canvas.width = maxW
+        canvas.height = maxH
+      }
+      draw()
     }
-    id = requestAnimationFrame(loop)
-    return () => cancelAnimationFrame(id)
+    resize()
+    window.addEventListener('resize', resize)
+    return () => window.removeEventListener('resize', resize)
   }, [draw])
 
-  // Load best
   useEffect(() => {
-    setBest(parseInt(localStorage.getItem('snake-best') || '0'))
+    setBest(parseInt(localStorage.getItem('piano-best') || '0'))
     draw()
   }, [draw])
 
-  // Keyboard
   useEffect(() => {
-    const map: Record<string, Dir> = {
-      ArrowUp: 'U', ArrowDown: 'D', ArrowLeft: 'L', ArrowRight: 'R',
-      w: 'U', s: 'D', a: 'L', d: 'R',
-    }
-    const opposite: Record<Dir, Dir> = { U: 'D', D: 'U', L: 'R', R: 'L' }
-    const handler = (e: KeyboardEvent) => {
-      const d = map[e.key]
-      if (!d) return
-      e.preventDefault()
-      if (phase === 'idle' || phase === 'dead') { startGame(); return }
-      if (d !== opposite[dir.current]) nextDir.current = d
-    }
-    window.addEventListener('keydown', handler)
-    return () => window.removeEventListener('keydown', handler)
-  }, [phase, startGame])
-
-  // Touch
-  const touchStart = useRef<{ x: number; y: number } | null>(null)
-  const handleTouchStart = (e: React.TouchEvent) => {
-    touchStart.current = { x: e.touches[0].clientX, y: e.touches[0].clientY }
-  }
-  const handleTouchEnd = (e: React.TouchEvent) => {
-    if (!touchStart.current) return
-    const dx = e.changedTouches[0].clientX - touchStart.current.x
-    const dy = e.changedTouches[0].clientY - touchStart.current.y
-    if (Math.max(Math.abs(dx), Math.abs(dy)) < 20) return
-    const opposite: Record<Dir, Dir> = { U: 'D', D: 'U', L: 'R', R: 'L' }
-    let d: Dir
-    if (Math.abs(dx) > Math.abs(dy)) d = dx > 0 ? 'R' : 'L'
-    else d = dy > 0 ? 'D' : 'U'
-    if (d !== opposite[dir.current]) nextDir.current = d
-    touchStart.current = null
-  }
-
-  const dpadMove = (d: Dir) => {
-    const opposite: Record<Dir, Dir> = { U: 'D', D: 'U', L: 'R', R: 'L' }
-    if (phase === 'idle' || phase === 'dead') { startGame(); return }
-    if (d !== opposite[dir.current]) nextDir.current = d
-  }
+    return () => { if (frameRef.current) cancelAnimationFrame(frameRef.current) }
+  }, [])
 
   return (
-    <div className="min-h-screen flex flex-col items-center justify-center"
-      style={{ background: '#0a0a14', color: '#eaeaea', fontFamily: 'system-ui, sans-serif' }}>
-
-      <h1 style={{
-        fontSize: '2.8rem', fontWeight: 900, letterSpacing: '-2px',
-        background: 'linear-gradient(135deg, #2ed573, #1abc9c)',
-        WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent',
-        marginBottom: 6,
-      }}>SNAKE</h1>
-
-      {/* Scores */}
-      <div style={{ display: 'flex', gap: 12, marginBottom: 16 }}>
-        {[['점수', displayScore], ['최고', best], [`레벨 ${level}`, '']].map(([label, val]) => (
-          <div key={label as string} style={{
-            background: '#1a1a2e', border: '1px solid #2a2a4a', borderRadius: 10,
-            padding: '8px 20px', textAlign: 'center', minWidth: 80,
-          }}>
-            <div style={{ fontSize: '0.65rem', color: '#666', letterSpacing: 1, textTransform: 'uppercase' }}>{label}</div>
-            <div style={{ fontSize: '1.4rem', fontWeight: 800 }}>{val}</div>
+    <div style={{
+      minHeight: '100dvh',
+      background: '#0a0a0a',
+      display: 'flex',
+      flexDirection: 'column',
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: 12,
+      fontFamily: 'system-ui, sans-serif',
+      userSelect: 'none',
+    }}>
+      {/* Header */}
+      <div style={{ display: 'flex', gap: 16, alignItems: 'center' }}>
+        <div style={{ textAlign: 'center' }}>
+          <div style={{ fontSize: '0.65rem', color: '#555', letterSpacing: 2, textTransform: 'uppercase' }}>최고</div>
+          <div style={{ fontSize: '1.4rem', fontWeight: 800, color: '#eee' }}>{best}</div>
+        </div>
+        <h1 style={{
+          fontSize: '1.6rem', fontWeight: 900, letterSpacing: -1,
+          background: 'linear-gradient(135deg, #fff, #888)',
+          WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent',
+        }}>피아노 타일</h1>
+        <div style={{ textAlign: 'center' }}>
+          <div style={{ fontSize: '0.65rem', color: '#555', letterSpacing: 2, textTransform: 'uppercase' }}>레벨</div>
+          <div style={{ fontSize: '1.4rem', fontWeight: 800, color: '#eee' }}>
+            {Math.floor(displayScore / 10) + 1}
           </div>
-        ))}
+        </div>
       </div>
 
       {/* Canvas */}
       <div style={{ position: 'relative' }}>
         <canvas
           ref={canvasRef}
-          width={W}
-          height={H}
-          style={{ borderRadius: 12, display: 'block', border: '1px solid #2a2a4a',
-            boxShadow: '0 20px 60px rgba(46,213,115,0.08)' }}
-          onTouchStart={handleTouchStart}
-          onTouchEnd={handleTouchEnd}
+          style={{ display: 'block', borderRadius: 16, touchAction: 'none' }}
+          onPointerDown={e => {
+            e.preventDefault()
+            if (phase === 'idle' || phase === 'dead') { startGame(); return }
+            handleTap(e.clientX, e.clientY)
+          }}
         />
 
         {/* Overlay */}
         {(phase === 'idle' || phase === 'dead') && (
           <div style={{
-            position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column',
-            alignItems: 'center', justifyContent: 'center', gap: 14,
-            background: 'rgba(10,10,20,0.85)', borderRadius: 12,
-            backdropFilter: 'blur(4px)',
+            position: 'absolute', inset: 0, borderRadius: 16,
+            background: 'rgba(0,0,0,0.82)',
+            display: 'flex', flexDirection: 'column',
+            alignItems: 'center', justifyContent: 'center', gap: 16,
+            backdropFilter: 'blur(6px)',
           }}>
-            {phase === 'dead' && (
+            {phase === 'dead' ? (
               <>
-                <div style={{ fontSize: '1.8rem', fontWeight: 900, color: '#e94560' }}>게임 오버</div>
-                <div style={{ color: '#888', fontSize: '0.9rem' }}>점수: {displayScore}</div>
+                <div style={{ fontSize: '2rem', fontWeight: 900, color: '#ff4444' }}>실패!</div>
+                <div style={{ fontSize: '3rem', fontWeight: 900, color: '#fff' }}>{displayScore}</div>
+                <div style={{ color: '#555', fontSize: '0.85rem' }}>최고기록 {best}</div>
+              </>
+            ) : (
+              <>
+                <div style={{ fontSize: '2.5rem' }}>🎹</div>
+                <div style={{ fontSize: '1.4rem', fontWeight: 900, color: '#fff' }}>피아노 타일</div>
+                <div style={{ color: '#555', fontSize: '0.85rem', textAlign: 'center', lineHeight: 1.6 }}>
+                  검은 타일을 탭하세요<br/>놓치면 게임 오버!
+                </div>
               </>
             )}
-            {phase === 'idle' && (
-              <div style={{ fontSize: '1.8rem', fontWeight: 900, color: '#2ed573' }}>🐍 SNAKE</div>
-            )}
             <button
-              onClick={startGame}
+              onPointerDown={e => { e.stopPropagation(); startGame() }}
               style={{
-                background: 'linear-gradient(135deg, #2ed573, #1abc9c)',
-                color: '#0a0a14', border: 'none', borderRadius: 10,
-                padding: '12px 32px', fontSize: '1rem', fontWeight: 800,
-                cursor: 'pointer', letterSpacing: 0.5,
+                background: '#fff', color: '#000',
+                border: 'none', borderRadius: 50,
+                padding: '14px 40px', fontSize: '1rem', fontWeight: 800,
+                cursor: 'pointer', marginTop: 8,
               }}>
-              {phase === 'dead' ? '다시 시작' : '시작하기'}
+              {phase === 'dead' ? '다시 시작' : '시작'}
             </button>
-            <div style={{ color: '#444', fontSize: '0.8rem' }}>← → ↑ ↓ 또는 WASD</div>
           </div>
         )}
-      </div>
-
-      {/* D-pad (mobile) */}
-      <div style={{ display: 'grid', gridTemplateAreas: `". up ." "left . right" ". down ."`,
-        gridTemplateColumns: 'repeat(3, 52px)', gridTemplateRows: 'repeat(3, 52px)',
-        gap: 6, marginTop: 16 }}>
-        {([['up', 'U', '↑'], ['down', 'D', '↓'], ['left', 'L', '←'], ['right', 'R', '→']] as const).map(([area, d, icon]) => (
-          <button key={area} onClick={() => dpadMove(d)}
-            style={{ gridArea: area, background: '#1a1a2e', border: '1px solid #2a2a4a',
-              borderRadius: 10, color: '#ccc', fontSize: '1.3rem', cursor: 'pointer' }}>
-            {icon}
-          </button>
-        ))}
       </div>
     </div>
   )
